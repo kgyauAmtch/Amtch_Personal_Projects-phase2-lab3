@@ -54,7 +54,7 @@ df_raw = (
 logger.info("Loading songs and joining genres...")
 songs_df = (
     spark.read.parquet(SONGS_PARQUET)
-         .select("track_id", "track_genre")
+         .select("track_id", "track_name", "track_genre")
          .dropDuplicates(["track_id"])
          .withColumn("track_genre", F.lower(F.col("track_genre")))
 )
@@ -62,6 +62,7 @@ songs_df = (
 stream_df = (
     df_raw.join(songs_df, on="track_id", how="left")
           .withColumn("track_genre", F.coalesce(F.col("track_genre"), F.lit("unknown")))
+          .withColumn("track_name", F.coalesce(F.col("track_name"), F.lit("unknown_song")))
           .withColumn("duration_ms", F.lit(180_000))  # Default duration placeholder
           .withColumn("day", F.date_format("listen_time", "yyyy-MM-dd"))
 )
@@ -69,24 +70,28 @@ stream_df = (
 # ── KPI Calculations ─────────────────────────────────────────────────────────
 logger.info("Computing KPIs...")
 
+# KPI 1 - Listen Count
 kpi1 = (
     stream_df.groupBy("day", "track_genre")
              .agg(F.count("*").alias("listen_count"))
              .withColumn("kpi_type", F.lit("listen_count"))
 )
 
+# KPI 2 - Unique Listeners
 kpi2 = (
     stream_df.groupBy("day", "track_genre")
              .agg(F.countDistinct("user_id").alias("unique_listeners"))
              .withColumn("kpi_type", F.lit("unique_listeners"))
 )
 
+# KPI 3 - Total Listening Time
 kpi3 = (
     stream_df.groupBy("day", "track_genre")
              .agg(F.sum("duration_ms").alias("total_listening_time_ms"))
              .withColumn("kpi_type", F.lit("total_listening_time"))
 )
 
+# KPI 4 - Average Listening Time per User
 kpi4 = (
     kpi2.join(kpi3, ["day", "track_genre"])
         .withColumn("avg_listening_time_ms",
@@ -95,8 +100,9 @@ kpi4 = (
         .withColumn("kpi_type", F.lit("avg_listening_time"))
 )
 
+# KPI 5 - Top 3 Songs per Genre per Day (using track_name)
 song_counts = (
-    stream_df.groupBy("day", "track_genre", "track_id")
+    stream_df.groupBy("day", "track_genre", "track_name")
              .agg(F.count("*").alias("play_count"))
 )
 
@@ -104,11 +110,12 @@ kpi5 = (
     song_counts
         .withColumn("rank", F.row_number().over(
             Window.partitionBy("day", "track_genre")
-                  .orderBy(F.col("play_count").desc())))
+                  .orderBy(F.col("play_count").desc(), F.col("track_name").asc())))
         .filter("rank <= 3")
         .withColumn("kpi_type", F.lit("top_3_songs"))
 )
 
+# KPI 6 - Top 5 Genres per Day
 genre_counts = (
     stream_df.groupBy("day", "track_genre")
              .agg(F.count("*").alias("genre_count"))
@@ -118,7 +125,7 @@ kpi6 = (
     genre_counts
         .withColumn("rank", F.row_number().over(
             Window.partitionBy("day")
-                  .orderBy(F.col("genre_count").desc())))
+                  .orderBy(F.col("genre_count").desc(), F.col("track_genre").asc())))
         .filter("rank <= 5")
         .withColumn("kpi_type", F.lit("top_5_genres"))
 )
@@ -128,9 +135,9 @@ kpi_list = [kpi1, kpi2, kpi3, kpi4, kpi5, kpi6]
 # ── Write KPIs to DynamoDB ───────────────────────────────────────────────────
 for idx, kpi_df in enumerate(kpi_list, 1):
     try:
-        kpi_df = kpi_df.withColumn("uuid", F.expr("uuid()"))  # UUID as primary key
-
+        kpi_df = kpi_df.withColumn("uuid", F.expr("uuid()"))  # Unique row ID
         dynf = DynamicFrame.fromDF(kpi_df, glue, f"kpi{idx}")
+
         glue.write_dynamic_frame.from_options(
             frame=dynf,
             connection_type="dynamodb",
@@ -142,7 +149,7 @@ for idx, kpi_df in enumerate(kpi_list, 1):
         )
         logger.info(f"✓ KPI {idx} written to DynamoDB ({kpi_df.count()} records)")
     except Exception as e:
-        logger.error(f"✗ Failed to write KPI {idx}: {str(e)}")
+        logger.error(f"Failed to write KPI {idx}: {str(e)}")
 
 job.commit()
-logger.info("✔ All KPIs computed and written to DynamoDB.")
+logger.info("All KPIs computed and written to DynamoDB.")
