@@ -1,113 +1,81 @@
-# 🎧 Music Streaming ETL & KPI Pipeline
+# Music Streaming Data Pipeline Project
 
-This project implements a fully automated ETL pipeline to process streaming music data, compute daily KPIs, and store insights in DynamoDB using AWS‑native services (Airflow MWAA, AWS Glue and S3).
+## Overview
+This project implements a data pipeline for processing music streaming data using AWS services and Apache Airflow. The pipeline ingests raw data from S3 buckets, validates and transforms it using AWS Glue jobs, calculates Key Performance Indicators (KPIs), and stores the results in DynamoDB.
 
----
+## Architecture
+- **Data Sources**: Raw data is stored in two S3 buckets (`S3 Bucket Raw streams` and `S3 Bucket songs and user`).
+- **Ingestion Tools**: 
+  - `S3KeySensor` detects new files in the raw S3 bucket.
+  - Apache Airflow orchestrates the workflow.
+  - `AWS Glue Transformation` processes and transforms data.
+- **Processing**: 
+  - Python operators validate and archive data.
+  - Glue jobs clean data and compute KPIs.
+- **Storage**: Processed data is archived in `S3 Archive`, and KPIs are loaded into `DynamoDB`.
 
-##  Project Overview
+![Architecture Diagram](attachment://Users/gyauk/github/phase2-labs/Amtch_Personal_Projects-phase2-lab3/Architecture_diagram.png)
 
-1. **Monitor** an S3 prefix for new stream files (`raw/streams/*.csv`).
-2. **Trigger** an Airflow DAG when a new file arrives.
-3. **Clean & transform** raw data with a Glue Spark job.
-4. **Compute daily KPIs** with a second Glue job.
-5. **Store** KPIs in a single DynamoDB table.
-6. **Archive** the processed file in S3.
+## Components
 
----
+### 1. **Airflow DAG (`dag.py`)**
+- Defines the ETL workflow with tasks for detecting new files, validating columns, running Glue jobs, and archiving data.
+- Uses `S3KeySensor` to monitor new `.csv` files every 10 minutes.
+- Includes branching logic to skip processed files.
 
-## Stack
+### 2. **Validation Script (`validation.py`)**
+- Validates CSV files against required columns.
+- Cleans data by removing rows with missing values in critical columns.
+- Writes validated data to a processed S3 bucket.
 
-| Layer          | Service                     | Purpose                                 |
-|----------------|-----------------------------|-----------------------------------------|
-| Orchestration  | Amazon MWAA (Airflow)       | DAG scheduling & dependency management  |
-| Processing     | AWS Glue (Spark)            | ETL + KPI calculations                  |
-| Storage        | Amazon S3                   | Raw, processed & archived data          |
-| Analytics DB   | Amazon DynamoDB             | Fast key‑value KPI store                |
-| Optional       | EMR Serverless              | Scalable ad‑hoc Spark workloads         |
+### 3. **Transformation Job (`transformation_job.py`)**
+- A Glue job that normalizes and transforms streams, songs, and users data.
+- Converts data types, handles duplicates, and writes results as Parquet files to `S3 Bucket processed`.
 
----
+### 4. **KPI Calculation Script (`daily_kpi.py`)**
+- Computes six KPIs using PySpark:
+  - Listen count per genre per day.
+  - Unique listeners per genre per day.
+  - Total listening time per genre per day.
+  - Average listening time per user per genre per day.
+  - Top 3 songs per genre per day.
+  - Top 5 genres per day.
+- Stores results in a DynamoDB table (`lab3_kpis`).
 
-## S3 Layout
+## Setup Instructions
 
-```text
-s3://lab3-bucket/
-├── raw/
-│   └── streams/
-    └── songs/
-    └── users/
-├── processed/
-│   ├── streams/
-|    ├── users/
-│   └── songs/
-└── archive/
-    └── streams/YYYY‑MM‑DD/
-```
+### Prerequisites
+- AWS account with appropriate permissions.
+- Apache Airflow installed and configured with AWS credentials.
+- AWS Glue jobs and DynamoDB table set up.
+- S3 buckets created with the specified prefixes.
 
----
+### Configuration
+- Update `dag.py` with your:
+  - `BUCKET_NAME`
+  - `AWS_REGION`
+  - `GLUE_ROLE_NAME`
+  - `GLUE_CLEAN_JOB` and `GLUE_KPI_JOB` names.
+- Ensure AWS credentials are set in Airflow's `aws_default` connection.
 
-## KPIs
+### Running the Pipeline
+1. Deploy the DAG to your Airflow environment.
+2. Upload raw `.csv` files to the `raw/streams/` S3 prefix.
+3. Monitor the Airflow UI for task execution.
+4. Check `S3 Archive` for archived files and `DynamoDB` for KPI results.
 
-| KPI                              | Description                                    |
-|----------------------------------|------------------------------------------------|
-| **Listen Count**                 | Total plays per genre/day                      |
-| **Unique Listeners**             | Distinct users per genre/day                   |
-| **Total Listening Time**         | Sum of duration per genre/day                  |
-| **Avg Listening Time per User**  | Listening time ÷ unique listeners             |
-| **Top 3 Songs / Genre / Day**    | Rank 1‑3 tracks by plays within each genre/day |
-| **Top 5 Genres / Day**           | Rank 1‑5 genres by total plays per day         |
+## Usage Notes
+- The pipeline runs every 10 minutes to detect new files.
+- Validation ensures required columns are present before processing.
+- Archived files are stored with a date-based prefix for organization.
 
----
+## Troubleshooting
+- Check Airflow logs for task failures.
+- Verify S3 bucket permissions and Glue job configurations.
+- Ensure DynamoDB table exists and has sufficient throughput.
 
-##  DynamoDB Schema
+## Contributing
+Feel free to submit issues or pull requests for enhancements.
 
-| Attribute        | Notes                               |
-|------------------|-------------------------------------|
-| `day_pk` (PK)    | `YYYY‑MM‑DD`                        |
-| `sort_key` (SK)  | `kpi_type#genre[#track_id]`         |
-| Other columns    | metric_value, rank, track_id, etc.  |
-| Billing mode     | `PAY_PER_REQUEST`                   |
-
-Example item:
-
-```json
-{
-  "day_pk": "2025-06-21",
-  "sort_key": "top_3_songs#pop#track_123",
-  "kpi_type": "top_3_songs",
-  "track_genre": "pop",
-  "track_id": "track_123",
-  "metric_value": 512,
-  "rank": 1
-}
-```
-
----
-
-## 🔁 Airflow DAG: `glue_stream_etl_pipeline`
-
-```mermaid
-graph LR
-A(Wait S3) --> B(Detect file) --> C(Glue: Clean) --> D(Glue: KPIs) --> E(Archive)
-```
-
-- **Schedule**: hourly (`@hourly`)  
-- **S3KeySensor** in *reschedule* mode (efficient polling)  
-- **Max active runs** set to 1 to avoid overlap.
-
----
-
-## Deployment Steps
-
-1. **Upload scripts**  
-   - `generate_daily_kpis.py` → `s3://lab3-bucket/scripts/`
-2. **Create Glue jobs**  
-   - `Transformation_job` (clean)  
-   - `dailykpis` (KPI calc)  
-3. **Grant IAM permissions**  
-   - Airflow role → `glue:StartJobRun`, `glue:GetJob*`, `s3:*`, `dynamodb:*`
-4. **Run the DAG** – new CSV in `raw/streams/` triggers full pipeline.
-
----
-
-
-
+## License
+This project is licensed under the MIT License.
