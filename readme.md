@@ -14,7 +14,7 @@ This project implements a data pipeline for processing music streaming data usin
   - Glue jobs clean data and compute KPIs.
 - **Storage**: Processed data is archived in `S3 Archive`, and KPIs are loaded into `DynamoDB`.
 
-![Architecture Diagram](attachment://Users/gyauk/github/phase2-labs/Amtch_Personal_Projects-phase2-lab3/Architecture_diagram.png)
+![Architecture Diagram](Architecture_diagram.png)
 
 ## Components
 
