@@ -1,155 +1,113 @@
-import sys
 import boto3
 import logging
-from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
-from awsglue.context import GlueContext
-from awsglue.job import Job
-from awsglue.dynamicframe import DynamicFrame
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
+import pandas as pd
+import uuid
+from datetime import datetime
+import pyarrow.parquet as pq
+import pyarrow.fs as fs
 
-# ── Glue setup ───────────────────────────────────────────────────────────────
-args = getResolvedOptions(sys.argv, ["JOB_NAME"])
-sc = SparkContext()
-glue = GlueContext(sc)
-spark = glue.spark_session
-job = Job(glue)
-job.init(args["JOB_NAME"], args)
-
-# ── Constants ────────────────────────────────────────────────────────────────
+# ── Config ──────────────────────────────────────────────────────────────────
 REGION = "eu-north-1"
 TABLE_KPI = "lab3_kpis"
-SOURCE_PARQUET = "s3://lab3-bucket/processed/streams/"
-SONGS_PARQUET = "s3://lab3-bucket/processed/songs/"
+STREAMS_PATH = "lab3-bucket/processed/streams/"
+SONGS_PATH = "lab3-bucket/processed/songs/"
 
-# ── Logging setup ────────────────────────────────────────────────────────────
-logger = logging.getLogger("kpi_job")
-logger.setLevel(logging.INFO)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("kpi_loader")
 
-# ── Ensure DynamoDB Table Exists ─────────────────────────────────────────────
-def create_table_if_absent(table_name: str):
+# ── DynamoDB Helper function ────────────────────────────────────────────────────────
+def create_table_if_absent():
     dynamodb = boto3.resource("dynamodb", region_name=REGION)
     try:
-        dynamodb.create_table(
-            TableName=table_name,
+        table = dynamodb.create_table(
+            TableName=TABLE_KPI,
             KeySchema=[{"AttributeName": "uuid", "KeyType": "HASH"}],
             AttributeDefinitions=[{"AttributeName": "uuid", "AttributeType": "S"}],
             ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 1000}
-        ).meta.client.get_waiter("table_exists").wait(TableName=table_name)
-        logger.info(f"DynamoDB table {table_name} created.")
-    except dynamodb.meta.client.exceptions.ResourceInUseException:
-        logger.info(f"DynamoDB table {table_name} already exists.")
-
-create_table_if_absent(TABLE_KPI)
-
-# ── Load Streams Data ────────────────────────────────────────────────────────
-logger.info("Loading streams data from S3...")
-df_raw = (
-    spark.read.parquet(SOURCE_PARQUET)
-         .filter(F.col("record_type") == "stream")
-)
-
-# ── Load Songs Data and Join ─────────────────────────────────────────────────
-logger.info("Loading songs and joining genres...")
-songs_df = (
-    spark.read.parquet(SONGS_PARQUET)
-         .select("track_id", "track_name", "track_genre")
-         .dropDuplicates(["track_id"])
-         .withColumn("track_genre", F.lower(F.col("track_genre")))
-)
-
-stream_df = (
-    df_raw.join(songs_df, on="track_id", how="left")
-          .withColumn("track_genre", F.coalesce(F.col("track_genre"), F.lit("unknown")))
-          .withColumn("track_name", F.coalesce(F.col("track_name"), F.lit("unknown_song")))
-          .withColumn("duration_ms", F.lit(180_000))  # Default duration placeholder
-          .withColumn("day", F.date_format("listen_time", "yyyy-MM-dd"))
-)
-
-# ── KPI Calculations ─────────────────────────────────────────────────────────
-logger.info("Computing KPIs...")
-
-# KPI 1 - Listen Count
-kpi1 = (
-    stream_df.groupBy("day", "track_genre")
-             .agg(F.count("*").alias("listen_count"))
-             .withColumn("kpi_type", F.lit("listen_count"))
-)
-
-# KPI 2 - Unique Listeners
-kpi2 = (
-    stream_df.groupBy("day", "track_genre")
-             .agg(F.countDistinct("user_id").alias("unique_listeners"))
-             .withColumn("kpi_type", F.lit("unique_listeners"))
-)
-
-# KPI 3 - Total Listening Time
-kpi3 = (
-    stream_df.groupBy("day", "track_genre")
-             .agg(F.sum("duration_ms").alias("total_listening_time_ms"))
-             .withColumn("kpi_type", F.lit("total_listening_time"))
-)
-
-# KPI 4 - Average Listening Time per User
-kpi4 = (
-    kpi2.join(kpi3, ["day", "track_genre"])
-        .withColumn("avg_listening_time_ms",
-                    F.col("total_listening_time_ms") / F.col("unique_listeners"))
-        .select("day", "track_genre", "avg_listening_time_ms")
-        .withColumn("kpi_type", F.lit("avg_listening_time"))
-)
-
-# KPI 5 - Top 3 Songs per Genre per Day (using track_name)
-song_counts = (
-    stream_df.groupBy("day", "track_genre", "track_name")
-             .agg(F.count("*").alias("play_count"))
-)
-
-kpi5 = (
-    song_counts
-        .withColumn("rank", F.row_number().over(
-            Window.partitionBy("day", "track_genre")
-                  .orderBy(F.col("play_count").desc(), F.col("track_name").asc())))
-        .filter("rank <= 3")
-        .withColumn("kpi_type", F.lit("top_3_songs"))
-)
-
-# KPI 6 - Top 5 Genres per Day
-genre_counts = (
-    stream_df.groupBy("day", "track_genre")
-             .agg(F.count("*").alias("genre_count"))
-)
-
-kpi6 = (
-    genre_counts
-        .withColumn("rank", F.row_number().over(
-            Window.partitionBy("day")
-                  .orderBy(F.col("genre_count").desc(), F.col("track_genre").asc())))
-        .filter("rank <= 5")
-        .withColumn("kpi_type", F.lit("top_5_genres"))
-)
-
-kpi_list = [kpi1, kpi2, kpi3, kpi4, kpi5, kpi6]
-
-# ── Write KPIs to DynamoDB ───────────────────────────────────────────────────
-for idx, kpi_df in enumerate(kpi_list, 1):
-    try:
-        kpi_df = kpi_df.withColumn("uuid", F.expr("uuid()"))  # Unique row ID
-        dynf = DynamicFrame.fromDF(kpi_df, glue, f"kpi{idx}")
-
-        glue.write_dynamic_frame.from_options(
-            frame=dynf,
-            connection_type="dynamodb",
-            connection_options={
-                "dynamodb.output.tableName": TABLE_KPI,
-                "dynamodb.throughput.write.percent": "1.0",
-                "dynamodb.region": REGION,
-            },
         )
-        logger.info(f"✓ KPI {idx} written to DynamoDB ({kpi_df.count()} records)")
-    except Exception as e:
-        logger.error(f"Failed to write KPI {idx}: {str(e)}")
+        table.meta.client.get_waiter("table_exists").wait(TableName=TABLE_KPI)
+        logger.info("DynamoDB table created.")
+    except dynamodb.meta.client.exceptions.ResourceInUseException:
+        table = dynamodb.Table(TABLE_KPI)
+        logger.info("DynamoDB table already exists.")
+    return table
 
-job.commit()
-logger.info("All KPIs computed and written to DynamoDB.")
+# ── Read Parquet from S3 ─────────────────────────────────────────────────────
+def load_parquet_df(s3_path):
+    s3fs = fs.S3FileSystem(region=REGION)
+    dataset = pq.ParquetDataset(s3_path, filesystem=s3fs)
+    return dataset.read().to_pandas()
+
+# ── KPI Calculation ─────────────────────────────────────────────────────────
+def compute_kpis(streams_df, songs_df):
+    streams_df = streams_df[streams_df["record_type"] == "stream"].copy()
+
+    df = streams_df.merge(
+        songs_df.drop_duplicates("track_id"),
+        on="track_id",
+        how="left"
+    )
+    df["track_genre"] = df["track_genre"].fillna("unknown").str.lower()
+    df["track_name"] = df["track_name"].fillna("unknown_song")
+    df["duration_ms"] = 180_000  # default duration placeholder
+    df["day"] = pd.to_datetime(df["listen_time"]).dt.date
+
+    kpi1 = df.groupby(["day", "track_genre"], as_index=False).agg(listen_count=("track_id", "count"))
+    kpi2 = df.groupby(["day", "track_genre"], as_index=False).agg(unique_listeners=("user_id", pd.Series.nunique))
+    kpi3 = df.groupby(["day", "track_genre"], as_index=False).agg(total_listening_time_ms=("duration_ms", "sum"))
+
+    kpi4 = kpi2.merge(kpi3, on=["day", "track_genre"])
+    kpi4["avg_listening_time_ms"] = kpi4["total_listening_time_ms"] / kpi4["unique_listeners"]
+    kpi4 = kpi4[["day", "track_genre", "avg_listening_time_ms"]]
+
+    song_counts = df.groupby(["day", "track_genre", "track_name"], as_index=False).agg(play_count=("track_id", "count"))
+    song_counts["rank"] = song_counts.groupby(["day", "track_genre"]).play_count.rank(method="first", ascending=False)
+    top3 = song_counts[song_counts["rank"] <= 3][["day", "track_genre", "track_name", "play_count"]]
+
+    genre_counts = df.groupby(["day", "track_genre"], as_index=False).agg(genre_count=("track_id", "count"))
+    genre_counts["rank"] = genre_counts.groupby("day").genre_count.rank(method="first", ascending=False)
+    top5 = genre_counts[genre_counts["rank"] <= 5][["day", "track_genre", "genre_count"]]
+
+    return {
+        "listen_count": kpi1,
+        "unique_listeners": kpi2,
+        "total_listening_time_ms": kpi3,
+        "avg_listening_time_ms": kpi4,
+        "top_3_songs": top3,
+        "top_5_genres": top5,
+    }
+
+# ── Write to DynamoDB ────────────────────────────────────────────────────────
+def write_to_dynamodb(kpi_dict, table):
+    client = boto3.client("dynamodb", region_name=REGION)
+
+    for kpi_type, df in kpi_dict.items():
+        for _, row in df.iterrows():
+            item = {
+                "uuid": {"S": str(uuid.uuid4())},
+                "kpi_type": {"S": kpi_type},
+                "day": {"S": str(row["day"])},
+            }
+
+            for col in row.index:
+                if col in ["day"]:
+                    continue
+                val = row[col]
+                if pd.isnull(val):
+                    continue
+                item[col] = {"N": str(round(val, 2))} if isinstance(val, (int, float)) else {"S": str(val)}
+
+            client.put_item(TableName=TABLE_KPI, Item=item)
+
+# ── Run ──────────────────────────────────────────────────────────────────────
+logger.info("Loading cleaned data...")
+streams_df = load_parquet_df(STREAMS_PATH)
+songs_df = load_parquet_df(SONGS_PATH)
+
+logger.info("Computing KPIs...")
+kpis = compute_kpis(streams_df, songs_df)
+
+logger.info("Writing KPIs to DynamoDB...")
+table = create_table_if_absent()
+write_to_dynamodb(kpis, table)
+logger.info("All KPIs successfully written with descriptive columns.")
