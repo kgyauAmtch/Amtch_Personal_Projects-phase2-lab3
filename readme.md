@@ -74,8 +74,3 @@ This project implements a data pipeline for processing music streaming data usin
 - Verify S3 bucket permissions and Glue job configurations.
 - Ensure DynamoDB table exists and has sufficient throughput.
 
-## Contributing
-Feel free to submit issues or pull requests for enhancements.
-
-## License
-This project is licensed under the MIT License.
