@@ -18,7 +18,7 @@ try:
 except Exception:
     args = getResolvedOptions(sys.argv, ["JOB_NAME"])
     job_name = args["JOB_NAME"]
-    streams_input_path = "s3://lab3-bucket/raw/streams/streams1.csv"  # fallback
+    streams_input_path = "s3://lab3-bucket/validated/streams/streams1.csv"  # fallback
     logger_msg = "No --INPUT_FILE_PATH passed; using fallback test file."
 
 logger = logging.getLogger()
@@ -35,7 +35,7 @@ spark        = glueContext.spark_session
 job          = Job(glueContext)
 job.init(job_name, args)
 
-RAW_BASE         = "s3://lab3-bucket/raw"
+Validated_base         = "s3://lab3-bucket/validated"
 PROCESSED_BASE = "s3://lab3-bucket/processed"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -137,7 +137,7 @@ glueContext.write_dynamic_frame.from_options(
 )
 
 # SONGS
-songs_clean = transform_songs(glueContext, read_wrap(f"{RAW_BASE}/songs/songs.csv"))
+songs_clean = transform_songs(glueContext, read_wrap(f"{Validated_base}/songs/songs.csv"))
 glueContext.write_dynamic_frame.from_options(
     frame=songs_clean,
     connection_type="s3",
@@ -146,7 +146,7 @@ glueContext.write_dynamic_frame.from_options(
 )
 
 # USERS
-users_clean = transform_users(glueContext, read_wrap(f"{RAW_BASE}/users/users.csv"))
+users_clean = transform_users(glueContext, read_wrap(f"{Validated_base}/users/users.csv"))
 glueContext.write_dynamic_frame.from_options(
     frame=users_clean,
     connection_type="s3",
