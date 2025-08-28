@@ -93,30 +93,16 @@ The pipeline handles streaming data arriving in batch files at irregular interva
    - Upload `test.py` to your MWAA DAGs folder in S3.
    - Trigger the DAG manually or wait for schedule.
 
-5. **Run Initial Jobs for Songs/Users**:
-   - Manually run `rawtoprocessed-usrnsongs.py` and `processedtodynamo-usrnsongs.py` Glue jobs to populate DynamoDB with base data.
-
 ## Running the Pipeline
 - The DAG runs hourly, checking for new stream files.
 - Monitor in Airflow UI (MWAA console).
 - After processing, query DynamoDB for KPIs (e.g., using AWS Console or SDK).
-
-### Sample DynamoDB Queries
-- Get a song: `SELECT * FROM lab3 WHERE uuid = 'song_trackid123'`
-- Get streams: `SELECT * FROM lab3 WHERE record_type = 'stream'`
-- For KPIs: Assuming KPIs are stored with UUIDs like "kpi_genre_date", query by partition key.
 
 ## Logging & Error Handling
 - Glue jobs include standard logging via CloudWatch.
 - Airflow tasks have retries (2) and logging.
 - Add custom error handling in Python functions (e.g., raise exceptions on no files).
 
-## Evaluation Criteria (From Project Spec)
-- Proper Airflow DAG orchestration with MWAA.
-- Efficient Glue PySpark jobs.
-- Data validation (e.g., drop NA, check columns).
-- Optimized DynamoDB (provisioned throughput, UUID keys).
-- This README serves as structured documentation.
 
 ## Troubleshooting
 - Check CloudWatch Logs for Glue job errors.
